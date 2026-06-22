@@ -19,11 +19,53 @@ jobs:
           node-version: 24.x
           registry-url: https://registry.npmjs.org
           cache: npm
-      # npm >= 11.5.1 is required for OIDC Trusted Publishing; ensure a current npm.
-      - run: npm install -g npm@latest
-      - run: npm ci
+      # npm >= 11.5.1 is required for OIDC Trusted Publishing; pin a known-good version.
+      - run: npm install -g npm@11.5.1
+      - run: npm ci || npm install
       - run: npm run build
       - run: npm test
       - run: npm run typecheck
       - run: npm run pack:dry
+      # Defense-in-depth: scan the exact tarball npm would upload for secret-shaped
+      # filenames and contents. Self-contained (no repo scripts); fails closed.
+      - name: Secret scan of packed tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Build the exact artifact `npm publish` would upload (last stdout line = filename).
+          TARBALL="$(npm pack --silent | tail -n1)"
+          echo "Scanning packed tarball: $TARBALL"
+
+          # 1) Fail on credential-shaped filenames (allow .env.example / .sample / .template).
+          FILES="$(tar -tzf "$TARBALL")"
+          echo "$FILES"
+          BAD_FILES="$(printf '%s\n' "$FILES" \
+            | grep -Ei '(^|/)(\.npmrc|\.netrc|id_rsa|id_dsa|credentials|service-account[^/]*|\.env(\.[^/]+)?)$|\.(pem|key|p12|pfx)$' \
+            | grep -Eiv '\.env\.(example|sample|template)$' || true)"
+          if [ -n "$BAD_FILES" ]; then
+            echo "::error::Credential-shaped filename(s) found in package tarball:"
+            printf '%s\n' "$BAD_FILES"
+            exit 1
+          fi
+
+          # 2) Extract and scan packed file contents for secret shapes.
+          TMPDIR="$(mktemp -d)"
+          tar -xzf "$TARBALL" -C "$TMPDIR"
+          HITS="$(grep -REiIn \
+            -e 'BEGIN .*PRIVATE KEY' \
+            -e 'AKIA[0-9A-Z]{16}' \
+            -e 'gh[pousr]_[A-Za-z0-9_]{30,}' \
+            -e 'npm_[A-Za-z0-9]{36,}' \
+            -e 'sk-ant-' \
+            -e 'AIza[0-9A-Za-z_-]{35}' \
+            -e 'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' \
+            "$TMPDIR" || true)"
+          rm -rf "$TMPDIR"
+          if [ -n "$HITS" ]; then
+            echo "::error::Secret-shaped content found in package tarball:"
+            printf '%s\n' "$HITS"
+            exit 1
+          fi
+
+          echo "Secret scan passed: no credential-shaped files or secret content found."
       - run: npm publish --access public

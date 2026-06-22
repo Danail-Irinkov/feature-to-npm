@@ -6,3 +6,20 @@ coverage/
 .env.*
 !.env.example
 .DS_Store
+
+# Extraction artifact: records the author's absolute source path + private file tree.
+extraction-manifest.json
+
+# Logs and secret-shaped files — never commit these to a public package repo.
+*.log
+*.pem
+*.key
+id_rsa
+id_dsa
+credentials
+service-account*
+.npmrc
+.netrc
+.aws/
+.kube/
+.swarm/
