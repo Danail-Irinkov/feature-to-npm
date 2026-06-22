@@ -1,0 +1,14 @@
+{
+  "name": "feature-to-npm",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Claude skill that extracts an application feature into a publishable npm package.",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "//": "vitest is a DEV-ONLY dependency for this skill's own tests. The shipped skill in scripts/ must stay dependency-free (node: builtins only) and never imports vitest or any other package.",
+  "devDependencies": {
+    "vitest": "^2"
+  }
+}

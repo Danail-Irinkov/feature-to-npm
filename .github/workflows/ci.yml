@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: npm
+          # This repo ships no package-lock.json (the skill stays dependency-free
+          # and vitest is the only devDependency), so key the npm cache off
+          # package.json. Without this, setup-node fails with "Dependencies lock
+          # file is not found".
+          cache-dependency-path: package.json
+      - run: npm install
+      - run: npm test
