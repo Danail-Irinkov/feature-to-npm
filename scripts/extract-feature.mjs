@@ -21,6 +21,10 @@ const FRAMEWORK_PEERS = new Set([
   '@nestjs/common', '@nestjs/core',
 ])
 
+// Version specifiers that must never be published verbatim: they leak private package
+// sources or are uninstallable from the public registry.
+const PRIVATE_RANGE_RE = /^(?:workspace:|file:|link:|portal:|catalog:|git\+|https?:\/\/)/
+
 function parseArgs(argv) {
   const args = { entries: [], license: 'MIT', force: false }
   for (let i = 0; i < argv.length; i += 1) {
@@ -107,9 +111,11 @@ function inferVersion(sourcePkg, depName) {
     || '*'
 }
 
-function buildPackageJson({ packageName, description, license, author, repoUrl, externalDependencies, sourcePkg }) {
+function buildPackageJson({ packageName, description, license, author, repoUrl, externalDependencies, sourcePkg, hasStyleAssets }) {
   const dependencies = {}
   const peerDependencies = {}
+  const optionalDependencies = {}
+  const peerDependenciesMeta = {}
   const devDependencies = {
     '@arethetypeswrong/cli': 'latest',
     publint: 'latest',
@@ -117,15 +123,24 @@ function buildPackageJson({ packageName, description, license, author, repoUrl, 
     typescript: 'latest',
     vitest: 'latest',
   }
+  const needsManualVersion = []
+  const privateDeps = []
 
   for (const depName of externalDependencies) {
     if (!depName || depName.startsWith('node:')) continue
     const version = inferVersion(sourcePkg, depName)
-    if (sourcePkg.peerDependencies?.[depName] || FRAMEWORK_PEERS.has(depName)) {
+    if (version === '*') needsManualVersion.push(depName)
+    if (PRIVATE_RANGE_RE.test(String(version))) privateDeps.push(`${depName}@${version}`)
+
+    const isPeer = Boolean(sourcePkg.peerDependencies?.[depName]) || FRAMEWORK_PEERS.has(depName)
+    const isOptional = Boolean(sourcePkg.optionalDependencies?.[depName])
+    if (isPeer) {
       peerDependencies[depName] = version
       devDependencies[depName] = version
-    } else if (sourcePkg.optionalDependencies?.[depName]) {
-      dependencies[depName] = version
+      if (isOptional) peerDependenciesMeta[depName] = { optional: true }
+    } else if (isOptional) {
+      // Preserve optionality — flattening these into dependencies makes them mandatory installs.
+      optionalDependencies[depName] = version
     } else {
       dependencies[depName] = version
     }
@@ -136,7 +151,9 @@ function buildPackageJson({ packageName, description, license, author, repoUrl, 
     version: '0.1.0',
     description: description || 'Reusable library extracted from an existing application feature.',
     type: 'module',
-    sideEffects: false,
+    // Only safe to mark side-effect-free when the closure ships no style/asset imports a
+    // bundler could otherwise tree-shake away.
+    sideEffects: hasStyleAssets ? ['**/*.css', '**/*.scss', '**/*.sass', '**/*.less'] : false,
     main: './dist/index.cjs',
     module: './dist/index.js',
     types: './dist/index.d.ts',
@@ -160,11 +177,15 @@ function buildPackageJson({ packageName, description, license, author, repoUrl, 
     keywords: [],
     author: author || '',
     license,
+    packageManager: 'npm@11.5.1',
     publishConfig: { access: 'public' },
     dependencies,
     peerDependencies,
+    optionalDependencies,
     devDependencies,
   }
+
+  if (Object.keys(peerDependenciesMeta).length) pkg.peerDependenciesMeta = peerDependenciesMeta
 
   if (repoUrl) {
     const cleanRepo = repoUrl.replace(/\.git$/, '')
@@ -175,8 +196,9 @@ function buildPackageJson({ packageName, description, license, author, repoUrl, 
 
   if (!Object.keys(pkg.dependencies).length) delete pkg.dependencies
   if (!Object.keys(pkg.peerDependencies).length) delete pkg.peerDependencies
+  if (!Object.keys(pkg.optionalDependencies).length) delete pkg.optionalDependencies
 
-  return pkg
+  return { pkg, needsManualVersion, privateDeps }
 }
 
 function createEdgeMap(manifest) {
@@ -222,6 +244,26 @@ function copyFeatureFiles({ sourceAbs, targetAbs, manifest }) {
   return copied
 }
 
+function defaultExportName(entryRel) {
+  const base = entryRel.replace(/\.[cm]?[jt]sx?$/, '')
+  const parts = base.split('/')
+  let name = parts[parts.length - 1]
+  if (name === 'index') name = parts[parts.length - 2] || 'Default'
+  const pascal = name
+    .replace(/(^|[-_ ])([a-z])/g, (_, __, c) => c.toUpperCase())
+    .replace(/[^A-Za-z0-9]/g, '')
+  return /^[A-Za-z]/.test(pascal) ? pascal : `Default${pascal}`
+}
+
+function fileHasDefaultExport(absPath) {
+  try {
+    const src = fs.readFileSync(absPath, 'utf8')
+    return /export\s+default\b/.test(src) || /export\s*\{[^}]*\bdefault\b[^}]*\}/.test(src)
+  } catch {
+    return false
+  }
+}
+
 function generatePublicIndex({ targetAbs, entries, copiedFiles }) {
   const indexRel = 'src/index.ts'
   const indexAbs = path.join(targetAbs, 'src', 'index.ts')
@@ -229,6 +271,7 @@ function generatePublicIndex({ targetAbs, entries, copiedFiles }) {
   const copiedSet = new Set(copiedFiles)
   const entrySet = new Set(entries)
 
+  // Never overwrite a real public entry that was copied in as src/index.ts.
   if (copiedSet.has(indexRel) && entrySet.has(indexRel)) {
     return { generated: false, reason: 'entry-already-src-index' }
   }
@@ -238,9 +281,17 @@ function generatePublicIndex({ targetAbs, entries, copiedFiles }) {
   }
 
   const exportLines = []
+  const defaultReExports = []
   for (const entry of entries) {
     if (entry === indexRel) continue
-    exportLines.push(`export * from '${normalizeRelativeSpecifier(indexRel, entry)}'`)
+    const rel = normalizeRelativeSpecifier(indexRel, entry)
+    exportLines.push(`export * from '${rel}'`)
+    // `export *` never re-exports a default — surface it explicitly so a default-only API isn't lost.
+    if (fileHasDefaultExport(path.join(targetAbs, entry))) {
+      const name = defaultExportName(entry)
+      exportLines.push(`export { default as ${name} } from '${rel}'`)
+      defaultReExports.push({ entry, exportedAs: name })
+    }
   }
 
   if (!exportLines.length) {
@@ -254,13 +305,13 @@ function generatePublicIndex({ targetAbs, entries, copiedFiles }) {
 
   fs.mkdirSync(path.dirname(indexAbs), { recursive: true })
   fs.writeFileSync(indexAbs, `${exportLines.join('\n')}\n`)
-  return { generated: true, reason: 'exports-generated' }
+  return { generated: true, reason: 'exports-generated', defaultReExports }
 }
 
 function createSmokeTest(targetAbs, packageName) {
   const testPath = path.join(targetAbs, 'tests', 'smoke.test.ts')
   fs.mkdirSync(path.dirname(testPath), { recursive: true })
-  fs.writeFileSync(testPath, `import { describe, expect, test } from 'vitest'\n\nimport * as api from '../src/index'\n\ndescribe('${packageName}', () => {\n  test('exports an API surface', () => {\n    expect(api).toBeDefined()\n  })\n})\n`)
+  fs.writeFileSync(testPath, `import { describe, expect, test } from 'vitest'\n\nimport * as api from '../src/index'\n\ndescribe('${packageName}', () => {\n  test('exposes a non-empty public API', () => {\n    expect(Object.keys(api).length).toBeGreaterThan(0)\n  })\n})\n`)
 }
 
 function readManifestOrTrace(args, sourceAbs) {
@@ -302,7 +353,10 @@ try {
 
   const manifest = readManifestOrTrace(args, sourceAbs)
   const sourcePkg = readJsonSafe(path.join(sourceAbs, 'package.json')) || {}
-  const packageJson = buildPackageJson({
+  const hasStyleAssets = (manifest.files || []).some((item) =>
+    /\.(css|scss|sass|less)$/i.test(typeof item === 'string' ? item : item.to || item.from || ''),
+  )
+  const { pkg: packageJson, needsManualVersion, privateDeps } = buildPackageJson({
     packageName: args.packageName,
     description: args.description,
     license: args.license,
@@ -310,6 +364,7 @@ try {
     repoUrl: args.repoUrl,
     externalDependencies: manifest.externalDependencies || [],
     sourcePkg,
+    hasStyleAssets,
   })
 
   const year = String(new Date().getFullYear())
@@ -336,7 +391,22 @@ try {
   copyTemplate('CHANGELOG.md', 'CHANGELOG.md', replacements)
   copyTemplate('CONTRIBUTING.md', 'CONTRIBUTING.md', replacements)
   copyTemplate('SECURITY.md', 'SECURITY.md', replacements)
-  copyTemplate('LICENSE-MIT', 'LICENSE', replacements)
+
+  // License file MUST match the chosen SPDX id — never ship MIT text under another license.
+  const licenseWarnings = []
+  if (args.license === 'MIT') {
+    copyTemplate('LICENSE-MIT', 'LICENSE', replacements)
+  } else if (args.license === 'Apache-2.0') {
+    copyTemplate('LICENSE-APACHE', 'LICENSE', replacements)
+  } else {
+    fs.writeFileSync(
+      path.join(targetAbs, 'LICENSE'),
+      `${args.license}\n\nTODO: add the full ${args.license} license text before publishing.\n`,
+    )
+    licenseWarnings.push(
+      `License "${args.license}" has no bundled template — wrote a stub LICENSE; add the full text before publishing.`,
+    )
+  }
 
   writeJson(path.join(targetAbs, 'package.json'), packageJson)
   writeJson(path.join(targetAbs, 'extraction-manifest.json'), manifest)
@@ -351,10 +421,14 @@ try {
     copiedFiles: copiedFiles.length,
     externalDependencies: manifest.externalDependencies || [],
     unresolved: manifest.unresolved || [],
+    needsManualVersion,
+    privateDeps,
+    licenseWarnings,
     publicIndex: indexResult,
     nextSteps: [
       'Review copied code for app coupling and private data.',
-      'Run npm install, npm run build, npm test, npm run typecheck, npm run pack:dry.',
+      'Run npm install to generate package-lock.json, then commit it (CI uses it).',
+      'Run npm run build, npm test, npm run typecheck, npm run pack:dry.',
       'Update README API docs and package repository metadata before publishing.',
       'Configure npm Trusted Publishing for .github/workflows/publish.yml.',
     ],
@@ -365,6 +439,13 @@ try {
   if ((manifest.unresolved || []).length) {
     console.warn('Warning: unresolved imports remain. Fix them before publishing.')
   }
+  if (needsManualVersion.length) {
+    console.warn(`Warning: no version inferred for: ${needsManualVersion.join(', ')} — left as "*". Set real ranges before publishing.`)
+  }
+  if (privateDeps.length) {
+    console.warn(`Warning: private/non-registry dependency specifiers copied: ${privateDeps.join(', ')} — replace with public versions or remove.`)
+  }
+  for (const w of licenseWarnings) console.warn(`Warning: ${w}`)
 } catch (error) {
   console.error(`extract-feature failed: ${error.message}`)
   usage()
