@@ -26,6 +26,10 @@ published.
 ## What it does
 
 - **Traces the minimal dependency closure** of your feature (no transplanting the whole app).
+- **Runs a pre-flight extractability audit** before any work: is this feature clean enough to
+  lift, and if not, what's holding it in? Returns a ranked report (ownership/license, secrets,
+  app coupling, framework entanglement) with one verdict — `EXTRACTABLE`, `NEEDS-PREP`, or
+  `BLOCKED` — then decouples with you, confirming the serious calls via multiple-choice.
 - **Scaffolds a clean package**: `tsdown` build, dual ESM/CJS + types, `vitest`, `publint` +
   `@arethetypeswrong/cli`, README/LICENSE/CHANGELOG/CONTRIBUTING/SECURITY.
 - **Audits for safety**: scans for leaked secrets, credential-shaped filenames, and hidden
@@ -81,8 +85,9 @@ de-couple, validate, audit, and publish.
 SKILL.md                     the skill's instructions (the entry point)
 scripts/                     dependency-free Node helpers
   trace-imports.mjs            trace a feature's import closure
+  audit-source.mjs             pre-flight: is the source feature extractable?
   extract-feature.mjs          scaffold the new package from a manifest
-  audit-package.mjs            secret / coupling / metadata audit
+  audit-package.mjs            secret / coupling / metadata audit (output package)
   lib/import-tracer.mjs        the tracer core
 assets/templates/            package scaffolding (package.json, tsdown, CI, license, ...)
 references/                  extraction checklist + rationale

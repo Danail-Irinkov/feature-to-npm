@@ -80,6 +80,39 @@ SKILL_DIR=path/to/feature-to-npm   # the folder holding this SKILL.md
 The scripts are dependency-free Node (>=18) and expect the source repo as the working
 directory.
 
+## Pre-flight: confirm the feature is extractable
+
+Extraction assumes a clean, decoupled feature. Before scaffolding anything, audit the
+feature in place so you are lifting clean code, not app-entangled code. This step is
+read-only — it changes nothing.
+
+Trace the closure (the same tracer as step 3) and scan the source:
+
+```bash
+node "$SKILL_DIR/scripts/trace-imports.mjs" --repo . \
+  --entry src/path/to/feature.ts --out extraction-manifest.json
+
+node "$SKILL_DIR/scripts/audit-source.mjs" --repo . \
+  --manifest extraction-manifest.json > extraction-audit.json
+```
+
+`audit-source.mjs` is a deterministic backbone — **necessary but not sufficient**. It is
+heuristic (it can over-report a test-only `process.env` read, or miss an app singleton
+imported under an unusual name), so read the flagged files and confirm with your own
+judgment. It returns one verdict:
+
+- `EXTRACTABLE` — go straight through the workflow below.
+- `NEEDS-PREP` — fixable coupling/framework/API problems; the "Remove app coupling" phase
+  below resolves them (confirming the serious calls with the user) before you package.
+- `BLOCKED` — stop. The one problem refactoring cannot fix is the right to open-source
+  (proprietary / no license / third-party code in the closure). Surface it and do not extract.
+
+It flags, by severity and location: ownership/license, secrets and private data inside the
+closure, app coupling (path aliases, `process.env` reads, app stores/services/loggers),
+framework entanglement (`react`/`vue`/… that belong in peer dependencies), closure health,
+and missing tests. Each item is tagged a **serious fork** (a design decision to confirm with
+the user) or a mechanical fix.
+
 ## Workflow
 
 ### 1. Inspect the source repo
@@ -128,16 +161,38 @@ document the additions. It can also over-report: import/export statements that l
 string or template literals (e.g. code that generates code) may surface as dependencies, so
 review the manifest's `externalDependencies` and drop anything that isn't a real import.
 
-### 4. Remove app coupling
+### 4. Remove app coupling (guided prepare)
 
-After copying, refactor anything that depends on the original app:
+Work from the pre-flight findings. Apply the mechanical fixes directly, but **do not silently
+make the serious calls** — confirm each one with the user using the platform's built-in
+multiple-choice prompt (in Claude Code, `AskUserQuestion`): 2-4 concrete options, a clear
+recommendation, option labels phrased as noun phrases, then apply only what the user picks.
+
+Mechanical (apply directly):
 
 - Replace alias imports with relative imports or package-level imports.
-- Replace direct env reads with options passed to exported functions/classes/components.
-- Replace app-specific clients, routers, stores, loggers, and analytics with injectable interfaces.
-- Move required framework contexts/providers into documented wrapper APIs.
+- Remove dead imports the decoupling leaves behind.
 - Convert source-only fixtures into package tests or examples.
 - Keep internal helpers unexported unless they are part of the intended API.
+
+Serious forks (confirm with a multiple-choice question first):
+
+- **Dependency injection shape** — for something now read from a global/env: constructor
+  option vs factory vs framework context/provider vs adapter interface.
+- **Public API shape** — what to export from the root, named vs default, and the names
+  consumers will see (renaming the public surface is a fork, not a cleanup).
+- **Framework ownership** — keep the framework (`react`/`vue`/…) as a peer dependency, or
+  split a framework-agnostic core from a thin framework adapter.
+- **License** — `MIT` (friendliest default) vs `Apache-2.0` (patent grant) vs another,
+  especially when third-party code is in the closure.
+- **Extraction scope** — for a shared helper: bundle it into the package, inline a copy, or
+  replace it with an existing npm dependency.
+- **Secret / private-data handling** — remove it, replace with an injected option, or drop
+  the file from the feature entirely.
+
+When decoupling forces changes to the source app's own call sites (a value now passed in
+rather than read from a global), tell the user and list every call site you touched. Then
+re-run `audit-source.mjs` and continue only once it reports `EXTRACTABLE`.
 
 ### 5. Build package metadata
 
