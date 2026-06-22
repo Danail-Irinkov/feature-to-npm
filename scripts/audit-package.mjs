@@ -2,14 +2,29 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+// Keep this list byte-identical to the copy in audit-source.mjs.
 const SECRET_PATTERNS = [
   { name: 'private-key', pattern: /-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/ },
   { name: 'aws-access-key', pattern: /AKIA[0-9A-Z]{16}/ },
   { name: 'github-token', pattern: /gh[pousr]_[A-Za-z0-9_]{30,}/ },
   { name: 'npm-token', pattern: /npm_[A-Za-z0-9]{36,}/ },
   { name: 'slack-token', pattern: /xox[baprs]-[A-Za-z0-9-]{20,}/ },
+  { name: 'openai-key', pattern: /sk-[A-Za-z0-9]{20,}/ },
+  { name: 'anthropic-key', pattern: /sk-ant-[A-Za-z0-9_-]{20,}/ },
+  { name: 'google-api-key', pattern: /AIza[0-9A-Za-z_-]{35}/ },
+  { name: 'stripe-key', pattern: /(?:sk|rk)_live_[0-9A-Za-z]{20,}/ },
+  { name: 'sendgrid-key', pattern: /SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/ },
+  { name: 'jwt', pattern: /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/ },
+  { name: 'basic-auth-url', pattern: /https?:\/\/[^/\s:@]+:[^/\s:@]+@/ },
   { name: 'generic-secret-assignment', pattern: /(?:secret|token|password|api[_-]?key)\s*[:=]\s*['"][^'"]{12,}['"]/i },
 ]
+
+// Version specifiers that will not install cleanly from the public npm registry.
+const PUBLISH_BLOCKING_DEP_PREFIXES = [
+  'workspace:', 'file:', 'link:', 'portal:', 'catalog:', 'git+', 'http://', 'https://',
+]
+// A dependency name in an apparently-internal scope (heuristic — public scopes like @types pass).
+const PRIVATE_SCOPE = /^@[^/]*(?:internal|private|secret|corp)[^/]*\//i
 
 const SUSPICIOUS_FILENAMES = [
   /^\.env(?:\.|$)/,
@@ -26,6 +41,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i]
     if (token === '--package-dir') args.packageDir = argv[++i]
+    else if (token === '--strict') args.strict = true
     else if (token === '--help' || token === '-h') args.help = true
     else throw new Error(`Unknown argument: ${token}`)
   }
@@ -34,7 +50,11 @@ function parseArgs(argv) {
 
 function usage() {
   console.log(`Usage:
-  node scripts/audit-package.mjs --package-dir <new-package-dir>
+  node scripts/audit-package.mjs --package-dir <new-package-dir> [--strict]
+
+  --strict   treat warnings as failures (exit 2). Use in CI / before publish.
+
+Exit codes: 0 clean, 2 findings (errors, or any warning under --strict), 1 usage/tool error.
 `)
 }
 
@@ -48,7 +68,7 @@ function readJsonSafe(filePath) {
 
 function walk(dir, root = dir, output = []) {
   for (const name of fs.readdirSync(dir)) {
-    if (['node_modules', '.git', 'dist', 'coverage'].includes(name)) continue
+    if (['node_modules', '.git', 'coverage'].includes(name)) continue
     const fullPath = path.join(dir, name)
     const rel = path.relative(root, fullPath)
     const stat = fs.statSync(fullPath)
@@ -78,13 +98,36 @@ function auditPackage(pkgDir) {
       }
     }
 
-    if (!pkg.repository) warnings.push({ severity: 'warn', message: 'package.json has no repository; set it before provenance publishing.' })
+    if (!pkg.repository) {
+      warnings.push({ severity: 'warn', message: 'package.json has no repository; set it before provenance publishing.' })
+    } else {
+      const repoUrl = typeof pkg.repository === 'string' ? pkg.repository : pkg.repository.url
+      if (typeof repoUrl === 'string' && repoUrl.includes('.git.git')) {
+        warnings.push({ severity: 'warn', message: 'package.json repository.url contains ".git.git"; remove the duplicated suffix.' })
+      }
+      if (typeof repoUrl === 'string' && repoUrl.startsWith('git@')) {
+        warnings.push({ severity: 'warn', message: 'package.json repository.url is an SSH URL ("git@…"); use an https git URL for provenance.' })
+      }
+    }
     if (pkg.name?.startsWith('@') && pkg.publishConfig?.access !== 'public') {
       findings.push({ severity: 'error', message: 'Scoped public packages should set publishConfig.access to public.' })
     }
     if (!pkg.exports?.['.']) warnings.push({ severity: 'warn', message: 'package.json exports does not define the root export ".".' })
     if (pkg.dependencies?.react || pkg.dependencies?.['react-dom']) {
       warnings.push({ severity: 'warn', message: 'React is in dependencies; it usually belongs in peerDependencies.' })
+    }
+
+    for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
+      const deps = pkg[field]
+      if (!deps || typeof deps !== 'object') continue
+      for (const [depName, depValue] of Object.entries(deps)) {
+        const value = typeof depValue === 'string' ? depValue : ''
+        if (value === '*' || PUBLISH_BLOCKING_DEP_PREFIXES.some((prefix) => value.startsWith(prefix))) {
+          findings.push({ severity: 'error', message: `${field} "${depName}" uses non-publishable version "${value}"; pin a public npm range before publishing.` })
+        } else if (PRIVATE_SCOPE.test(depName)) {
+          findings.push({ severity: 'error', message: `${field} "${depName}" looks like a private scope; it will not resolve from public npm.` })
+        }
+      }
     }
   }
 
@@ -116,8 +159,8 @@ function auditPackage(pkgDir) {
       }
     }
 
-    if (/TODO_REPOSITORY_URL|CHANGE_ME|TODO: Author/.test(content)) {
-      warnings.push({ severity: 'warn', file: rel, message: 'Placeholder text remains.' })
+    if (/TODO_REPOSITORY_URL|CHANGE_ME|TODO: Author|\{\{.*?\}\}|Reusable library extracted/.test(content)) {
+      warnings.push({ severity: 'warn', file: rel, message: 'Placeholder or scaffold-default text remains.' })
     }
   }
 
@@ -134,9 +177,11 @@ try {
 
   const packageDir = path.resolve(args.packageDir)
   const result = auditPackage(packageDir)
-  console.log(JSON.stringify({ packageDir, ...result }, null, 2))
+  console.log(JSON.stringify({ packageDir, strict: Boolean(args.strict), ...result }, null, 2))
 
-  if (result.findings.some((finding) => finding.severity === 'error')) {
+  const hasError = result.findings.some((finding) => finding.severity === 'error')
+  const hasWarning = result.warnings.length > 0
+  if (hasError || (args.strict && hasWarning)) {
     process.exit(2)
   }
 } catch (error) {

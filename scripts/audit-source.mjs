@@ -15,13 +15,21 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+// Keep this list byte-identical to the copy in audit-package.mjs.
 const SECRET_PATTERNS = [
   { name: 'private-key', pattern: /-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----/ },
   { name: 'aws-access-key', pattern: /AKIA[0-9A-Z]{16}/ },
   { name: 'github-token', pattern: /gh[pousr]_[A-Za-z0-9_]{30,}/ },
   { name: 'npm-token', pattern: /npm_[A-Za-z0-9]{36,}/ },
   { name: 'slack-token', pattern: /xox[baprs]-[A-Za-z0-9-]{20,}/ },
-  { name: 'generic-secret', pattern: /(?:secret|token|password|api[_-]?key)\s*[:=]\s*['"][^'"]{12,}['"]/i },
+  { name: 'openai-key', pattern: /sk-[A-Za-z0-9]{20,}/ },
+  { name: 'anthropic-key', pattern: /sk-ant-[A-Za-z0-9_-]{20,}/ },
+  { name: 'google-api-key', pattern: /AIza[0-9A-Za-z_-]{35}/ },
+  { name: 'stripe-key', pattern: /(?:sk|rk)_live_[0-9A-Za-z]{20,}/ },
+  { name: 'sendgrid-key', pattern: /SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/ },
+  { name: 'jwt', pattern: /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/ },
+  { name: 'basic-auth-url', pattern: /https?:\/\/[^/\s:@]+:[^/\s:@]+@/ },
+  { name: 'generic-secret-assignment', pattern: /(?:secret|token|password|api[_-]?key)\s*[:=]\s*['"][^'"]{12,}['"]/i },
 ]
 
 const SUSPICIOUS_FILENAMES = [
@@ -50,6 +58,13 @@ const APP_SMELL_SEGMENTS = [
 
 const INTERNAL_URL = /https?:\/\/[^\s'"`]*(?:\.internal\b|localhost|127\.0\.0\.1|\.local\b)/i
 
+// Heuristic PII / customer-data detection — every hit is a "review this" prompt, not proof of a leak.
+const PII_FILENAME_PATTERNS = [
+  /fixtures?/i, /seed/i, /dump/i, /customers?/i, /leads?/i, /exports?/i, /crm/i, /transcripts?/i, /recordings?/i,
+]
+const EMAIL_PATTERN = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g
+const PHONE_PATTERN = /(?<!\d)(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b/g
+
 const BINARY_EXT = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.pdf', '.zip', '.tgz', '.woff', '.woff2', '.wasm',
 ])
@@ -73,6 +88,8 @@ function usage() {
   console.log(`Usage:
   node audit-source.mjs --repo <source-repo> --manifest <extraction-manifest.json>
   node audit-source.mjs --repo <source-repo> --dir <feature-dir>
+
+Exit codes: 0 EXTRACTABLE, 1 NEEDS-PREP, 2 BLOCKED, 3 usage/tool error.
 `)
 }
 
@@ -147,8 +164,15 @@ function scanFile(rel, content, findings) {
   }
 
   const urlMatch = INTERNAL_URL.exec(content)
-  if (urlMatch) add({ severity: 'minor', category: 'private-data', fork: false, line: lineAt(content, urlMatch.index),
+  if (urlMatch) add({ severity: 'major', category: 'private-data', fork: false, line: lineAt(content, urlMatch.index),
     detail: `Internal/local URL in source ("${urlMatch[0].slice(0, 60)}"); remove or make configurable.` })
+
+  const emails = new Set([...content.matchAll(EMAIL_PATTERN)].map((x) => x[0].toLowerCase()))
+  const phones = new Set([...content.matchAll(PHONE_PATTERN)].map((x) => x[0]))
+  if (emails.size >= 3 || phones.size >= 3) {
+    add({ severity: 'major', category: 'pii-data', fork: true,
+      detail: `Possible customer/PII data (heuristic): ${emails.size} distinct email(s), ${phones.size} phone-like number(s); review before publishing.` })
+  }
 }
 
 function audit({ repoAbs, files, externalDependencies, unresolved }) {
@@ -159,6 +183,10 @@ function audit({ repoAbs, files, externalDependencies, unresolved }) {
     if (SUSPICIOUS_FILENAMES.some((p) => p.test(base) || p.test(rel))) {
       findings.push({ file: rel, severity: 'major', category: 'secret-file', fork: true,
         detail: 'Credential-shaped file in the closure; it must not be part of the package.' })
+    }
+    if (PII_FILENAME_PATTERNS.some((p) => p.test(base))) {
+      findings.push({ file: rel, severity: 'major', category: 'pii-data', fork: true,
+        detail: 'Filename looks like customer/PII data (heuristic); confirm it is safe to publish or exclude it.' })
     }
     if (BINARY_EXT.has(path.extname(rel).toLowerCase())) continue
     let content = ''
@@ -189,8 +217,12 @@ function audit({ repoAbs, files, externalDependencies, unresolved }) {
   }
 
   for (const item of unresolved || []) {
-    findings.push({ file: item.from || '(entry)', severity: 'minor', category: 'closure', fork: false,
-      detail: `Unresolved import "${item.specifier}" (${item.reason}); verify it is not hidden app coupling.` })
+    const spec = item.specifier || ''
+    const looksLocal = spec.startsWith('.') || ALIAS_PREFIXES.some((p) => spec.startsWith(p))
+    findings.push({ file: item.from || '(entry)', severity: looksLocal ? 'major' : 'minor', category: 'closure', fork: false,
+      detail: looksLocal
+        ? `Unresolved local import "${spec}" (${item.reason}); likely hidden app coupling — resolve or inject before publishing.`
+        : `Unresolved import "${spec}" (${item.reason}); verify it is not hidden app coupling.` })
   }
 
   const has = (sev) => findings.some((f) => f.severity === sev)
@@ -240,9 +272,10 @@ try {
 
   const result = audit({ repoAbs, files, externalDependencies, unresolved })
   console.log(JSON.stringify(result, null, 2))
-  process.exit(result.verdict === 'EXTRACTABLE' ? 0 : 2)
+  const EXIT_CODES = { EXTRACTABLE: 0, 'NEEDS-PREP': 1, BLOCKED: 2 }
+  process.exit(EXIT_CODES[result.verdict] ?? 2)
 } catch (error) {
   console.error(`audit-source failed: ${error.message}`)
   usage()
-  process.exit(1)
+  process.exit(3)
 }
