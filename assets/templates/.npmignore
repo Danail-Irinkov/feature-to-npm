@@ -1,0 +1,12 @@
+# The package.json "files" field is the primary publish allowlist.
+# Keep this file for tooling that still checks npmignore behavior.
+src/
+tests/
+.github/
+.changeset/
+tsdown.config.ts
+vitest.config.ts
+tsconfig.json
+*.tgz
+.env
+.env.*

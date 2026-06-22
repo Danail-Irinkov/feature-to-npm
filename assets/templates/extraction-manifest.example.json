@@ -1,0 +1,10 @@
+{
+  "sourceRepo": "/absolute/path/to/source-repo",
+  "entries": ["src/features/example/index.ts"],
+  "files": [
+    { "from": "src/features/example/index.ts", "to": "src/features/example/index.ts" },
+    { "from": "src/features/example/utils.ts", "to": "src/features/example/utils.ts" }
+  ],
+  "externalDependencies": ["zod"],
+  "unresolved": []
+}

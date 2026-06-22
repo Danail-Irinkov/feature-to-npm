@@ -1,0 +1,7 @@
+interface:
+  display_name: "feature-to-npm"
+  short_description: "Share a repo feature with the world as an open-source npm package"
+  brand_color: "#2563EB"
+  default_prompt: "Use the feature-to-npm skill to open-source this feature as a standalone npm library."
+policy:
+  allow_implicit_invocation: true
